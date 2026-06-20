@@ -55,8 +55,17 @@ def download_cell():
         run("git pull 2>/dev/null || true")
         return
     print(f"\nDownloading WRAITH to {INSTALL_DIR}...")
-    r = run(f"git clone --depth 1 {REPO} {INSTALL_DIR}")
+    # Clone to temp dir first, then move cell/ contents
+    temp_clone = INSTALL_DIR.parent / "wraith-temp-clone"
+    r = run(f"git clone --depth 1 {REPO} {temp_clone}")
     if r.returncode == 0:
+        # Move cell/ contents to install dir
+        cell_src = temp_clone / "cell"
+        if cell_src.exists():
+            shutil.copytree(cell_src, INSTALL_DIR)
+        else:
+            shutil.copytree(temp_clone, INSTALL_DIR)
+        shutil.rmtree(temp_clone, ignore_errors=True)
         return
     print("  Git not available. Downloading zip...")
     try:
