@@ -19,7 +19,5 @@ build/
 # IDE
 .vscode/
 .idea/
-
-# OS
-.DS_Store
-Thumbs.db
+*.swp
+*.swo

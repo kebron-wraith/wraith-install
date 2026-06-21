@@ -1,16 +1,31 @@
-# WRAITH Cell
+# WRAITH Cell — AI Security Organism
 
-Autonomous AI security cell with 26 agents, AI-powered threat analysis, P2P mesh networking, and self-evolution.
+WRAITH Cell is the distributed intelligence layer of the WRAITH security platform.
+Each cell runs 28 AI security agents on your device, operates independently,
+and connects to other cells via P2P mesh networking.
 
-## Install
+## One-Line Install
 
 ```bash
-# Windows
-powershell -c "iwr -useb https://kebron-wraith.github.io/wraith-install/install_wraith.py | iex"
+# Linux/macOS
+curl -fsSL https://wraith.one/install | bash
 
-# macOS/Linux  
-curl -fsSL https://kebron-wraith.github.io/wraith-install/install_wraith.py | python3
+# Windows
+powershell -c "iwr -useb https://wraith.one/install | iex"
 ```
 
+## Architecture
+
+- **28 AI Security Agents** — Scanner, Analyst, Sentinel, Ghost, and more
+- **P2P Mesh** — Cells communicate via Biomesh protocol (UDP 7736, TCP 7737)
+- **Ollama Support** — Auto-detects local LLM models
+- **Self-Evolution** — Learns from attacks, shares intelligence P2P
+- **Kill Switch** — Admin can remotely deactivate compromised cells
+
 ## License
-MIT
+
+MIT License — See [LICENSE](LICENSE) for details.
+
+---
+
+🦅 WRAITH — Forward-deployed Autonomous Knowledge Architecture
