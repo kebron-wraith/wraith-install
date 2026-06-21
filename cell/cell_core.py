@@ -2504,8 +2504,8 @@ class PasswordAuditor(BaseAgent):
 class PatchManager(BaseAgent):
     """Monitors and manages security patches."""
 
-    def __init__(self):
-        super().__init__("patch_manager", "1.0")
+    name = "patch_manager"
+    version = "1.0"
 
     def run(self) -> List[Finding]:
         self._set_running()
@@ -2551,8 +2551,8 @@ class PatchManager(BaseAgent):
 class BackupMonitor(BaseAgent):
     """Monitors backup integrity and schedules."""
 
-    def __init__(self):
-        super().__init__("backup_monitor", "1.0")
+    name = "backup_monitor"
+    version = "1.0"
 
     def run(self) -> List[Finding]:
         self._set_running()
@@ -2585,8 +2585,8 @@ class BackupMonitor(BaseAgent):
 class LogAnalyzer(BaseAgent):
     """Analyzes system logs for security events."""
 
-    def __init__(self):
-        super().__init__("log_analyzer", "1.0")
+    name = "log_analyzer"
+    version = "1.0"
 
     def run(self) -> List[Finding]:
         self._set_running()
@@ -2622,8 +2622,11 @@ class LogAnalyzer(BaseAgent):
 class ThreatIntelligence(BaseAgent):
     """Aggregates and shares threat intelligence."""
 
+    name = "threat_intelligence"
+    version = "1.0"
+
     def __init__(self, brain: Optional['CellBrain'] = None):
-        super().__init__("threat_intelligence", "1.0")
+        super().__init__()
         self.brain = brain
         self.iocs: List[Dict] = []
 
@@ -2657,8 +2660,11 @@ class ThreatIntelligence(BaseAgent):
 class SelfEvolver(BaseAgent):
     """Creates new defense code at runtime based on observed attacks."""
 
+    name = "self_evolver"
+    version = "1.0"
+
     def __init__(self, brain: Optional['CellBrain'] = None):
-        super().__init__("self_evolver", "1.0")
+        super().__init__()
         self.brain = brain
         self.defenses_created = 0
 
@@ -2712,6 +2718,9 @@ class SelfEvolver(BaseAgent):
 class HoneyPot(BaseAgent):
     """Deploys rotating fake services to detect attackers."""
 
+    name = "honeypot"
+    version = "1.0"
+
     FAKE_SERVICES = [
         {"name": "ftp", "port": 21, "banner": "vsFTPd 3.0.3"},
         {"name": "telnet", "port": 23, "banner": "Ubuntu 20.04 LTS"},
@@ -2724,7 +2733,7 @@ class HoneyPot(BaseAgent):
     ]
 
     def __init__(self):
-        super().__init__("honeypot", "1.0")
+        super().__init__()
         self.active_services: List[Dict] = []
         self.rotation_interval = 300
         self._last_rotation = 0
