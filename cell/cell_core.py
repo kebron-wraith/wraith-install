@@ -96,17 +96,29 @@ if not CELL_ID:
     if id_file.exists():
         CELL_ID = id_file.read_text().strip()
     else:
-        CELL_ID = f"cell_{uuid.uuid4().hex[:12]}"
+        CELL_ID = f"cell_{uuid.uuid4().hex}"  # Full 128-bit UUID
         # Atomic write to prevent race condition between concurrent instances
         tmp_file = id_file.with_suffix(".tmp")
         tmp_file.write_text(CELL_ID)
         tmp_file.rename(id_file)
 
+# Restrict .cell_id file permissions to owner-only
+try:
+    if sys.platform != "win32":
+        os.chmod(str(id_file), 0o600)
+except Exception:
+    pass
+
 ADMIN_SIGN_KEY: str = os.environ.get("WRAITH_ADMIN_SIGN_KEY", "")
-TRACKER_URL: str = os.environ.get("WRAITH_TRACKER_URL", "http://localhost:7734")
-OLLAMA_URL: str = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+TRACKER_URL: str = os.environ.get("WRAITH_TRACKER_URL", "https://localhost:7734")
+OLLAMA_URL: str = os.environ.get("OLLAMA_URL", "https://localhost:11434")
 BIOMESH_PORT: int = int(os.environ.get("WRAITH_BIOMESH_PORT", "8765"))
 HONEYPOT_BASE_PORT: int = int(os.environ.get("WRAITH_HONEYPOT_PORT", "9500"))
+
+# Fail to start if ADMIN_SIGN_KEY is not set
+if not ADMIN_SIGN_KEY:
+    log.critical("WRAITH_ADMIN_SIGN_KEY is not set — Admin commands will be rejected")
+    # Don't exit — cell can still operate in standalone mode, but Admin channel is disabled
 
 VERSION = "3.0.0"
 MAX_LOG_ENTRIES = 10_000
@@ -1930,20 +1942,21 @@ class CloudSecurityAgent(BaseAgent):
                                 try:
                                     content = f.read_text(errors="ignore")
                                     if "aws_secret_access_key" in content.lower():
+                                        # SECURITY: Don't include file paths in findings — they expose credential locations
                                         findings.append(Finding(
                                             agent=self.name,
                                             severity=Severity.CRITICAL,
-                                            title=f"AWS secret key in plaintext: {f}",
-                                            description="AWS secret access key found in plaintext file",
-                                            indicators={"file": str(f)},
+                                            title="AWS secret key in plaintext",
+                                            description="AWS secret access key found in plaintext cloud config file",
+                                            indicators={"type": "aws_plaintext_key"},
                                         ))
                                     if "password" in content.lower() and "=" in content:
                                         findings.append(Finding(
                                             agent=self.name,
                                             severity=Severity.HIGH,
-                                            title=f"Possible plaintext password: {f}",
-                                            description="Possible plaintext password in cloud config",
-                                            indicators={"file": str(f)},
+                                            title="Possible plaintext password in cloud config",
+                                            description="Possible plaintext password in cloud config file",
+                                            indicators={"type": "plaintext_password"},
                                         ))
                                 except Exception:
                                     pass
@@ -2658,7 +2671,11 @@ class ThreatIntelligence(BaseAgent):
 
 
 class SelfEvolver(BaseAgent):
-    """Creates new defense code at runtime based on observed attacks."""
+    """Creates new defense data at runtime based on observed attacks.
+
+    SECURITY: Does NOT generate executable code. All patterns are stored as
+    data (JSON) and evaluated by a fixed, audited detection engine.
+    """
 
     name = "self_evolver"
     version = "1.0"
@@ -2669,41 +2686,50 @@ class SelfEvolver(BaseAgent):
         self.defenses_created = 0
 
     def evolve(self, attack_pattern: Dict) -> Optional[str]:
-        """Create a new defense based on an observed attack pattern."""
+        """Store a new defense pattern based on an observed attack.
+
+        Returns the defense data as JSON string (NOT executable code).
+        The defense is stored as data and evaluated by DetectionEngine.
+        """
         num = self.defenses_created + 1
         now = datetime.utcnow().isoformat()
         atype = attack_pattern.get("type", "unknown")
         patterns = attack_pattern.get("patterns", [])
-        patterns_str = json.dumps(patterns)
 
-        lines = [
-            '"""',
-            f"Auto-generated defense v{num}",
-            f"Created: {now}",
-            f"Target: {atype}",
-            '"""',
-            "",
-            "import re",
-            "",
-            "",
-            "def detect_attack(data: str) -> bool:",
-            f'    """Auto-generated detection for {atype}"""',
-            f"    patterns = {patterns_str}",
-            "    for pat in patterns:",
-            "        if re.search(pat, data, re.IGNORECASE):",
-            "            return True",
-            "    return False",
-            "",
-        ]
-        defense_code = "\n".join(lines)
+        # Validate patterns — reject non-string and overly broad patterns
+        validated = []
+        for p in patterns:
+            if not isinstance(p, str):
+                continue
+            if len(p) > 500:
+                continue  # Reject excessively long patterns
+            # Reject patterns that are too broad (would match everything)
+            if p in (".", ".*", ".+", ""):
+                continue
+            try:
+                re.compile(p)  # Validate regex syntax
+                validated.append(p)
+            except re.error:
+                continue  # Skip invalid regex
+
+        if not validated:
+            return None
+
+        defense_data = {
+            "version": num,
+            "created": now,
+            "type": atype,
+            "patterns": validated,
+        }
+
         self.defenses_created += 1
         if self.brain:
             self.brain.install_skill(
                 f"auto_defense_{num}",
-                defense_code,
+                json.dumps(defense_data, indent=2),
                 atype
             )
-        return defense_code
+        return json.dumps(defense_data)
 
     def run(self) -> List[Finding]:
         self._set_running()
@@ -2712,6 +2738,7 @@ class SelfEvolver(BaseAgent):
             return []
         except Exception as e:
             self._set_error(str(e))
+            log.error(f"SelfEvolver error: {e}")
             return []
 
 
@@ -2771,6 +2798,67 @@ class HoneyPot(BaseAgent):
 
 
 # ═══════════════════════════════════════════════════════════════
+# WIRE PROTOCOL — Authenticated Admin communication
+# ═══════════════════════════════════════════════════════════════
+
+class WireProtocol:
+    """HMAC-SHA256 authenticated Admin command channel.
+
+    Every Admin command must include a timestamp + HMAC signature.
+    Rejects messages without valid signature or with timestamp older
+    than 60 seconds (replay protection).
+    """
+
+    TIMESTAMP_MAX_AGE = 60  # seconds
+
+    @staticmethod
+    def verify_command(payload: Dict, signature: str) -> bool:
+        """Verify an Admin command signature.
+
+        Args:
+            payload: Dict with 'command', 'timestamp', and data fields
+            signature: HMAC-SHA256 hex signature from Admin
+
+        Returns:
+            True if signature is valid and timestamp is fresh
+        """
+        if not ADMIN_SIGN_KEY:
+            log.warning("WireProtocol: ADMIN_SIGN_KEY not set — rejecting Admin command")
+            return False
+
+        # Check timestamp freshness
+        ts = payload.get("timestamp", "")
+        try:
+            cmd_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            age = abs((datetime.utcnow() - cmd_time.replace(tzinfo=None)).total_seconds())
+            if age > WireProtocol.TIMESTAMP_MAX_AGE:
+                log.warning(f"WireProtocol: stale command (age={age:.0f}s) — rejected")
+                return False
+        except (ValueError, TypeError):
+            log.warning("WireProtocol: invalid timestamp — rejected")
+            return False
+
+        # Verify HMAC-SHA256 signature
+        msg = json.dumps(payload, sort_keys=True).encode()
+        expected = hmac.new(
+            ADMIN_SIGN_KEY.encode(), msg, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            log.warning("WireProtocol: invalid signature — rejected")
+            return False
+
+        return True
+
+    @staticmethod
+    def sign_command(payload: Dict) -> str:
+        """Sign an Admin command (used by Admin side)."""
+        msg = json.dumps(payload, sort_keys=True).encode()
+        return hmac.new(
+            ADMIN_SIGN_KEY.encode(), msg, hashlib.sha256
+        ).hexdigest()
+
+
+# ═══════════════════════════════════════════════════════════════
 # CELL BRAIN — Persistent memory and learning
 # ═══════════════════════════════════════════════════════════════
 
@@ -2788,13 +2876,29 @@ class CellBrain:
     def _load_memory(self) -> Dict:
         if self.memory_file.exists():
             try:
-                return json.loads(self.memory_file.read_text())
-            except Exception:
-                pass
+                data = json.loads(self.memory_file.read_text())
+                # Basic structure validation
+                if not isinstance(data, dict):
+                    raise ValueError("memory.json is not a dict")
+                for key in ("learned_patterns", "attack_history", "skills_installed"):
+                    if key not in data:
+                        data[key] = []
+                return data
+            except Exception as e:
+                log.error(f"Corrupted memory.json: {e} — resetting")
+                # Backup corrupted file before reset
+                try:
+                    backup = self.memory_file.with_suffix(".corrupted.bak")
+                    self.memory_file.rename(backup)
+                except Exception:
+                    pass
         return {"learned_patterns": [], "attack_history": [], "skills_installed": []}
 
     def save_memory(self):
-        self.memory_file.write_text(json.dumps(self.memory, indent=2))
+        try:
+            self.memory_file.write_text(json.dumps(self.memory, indent=2))
+        except Exception as e:
+            log.error(f"Failed to save memory: {e}")
 
     def learn(self, pattern: Dict):
         """Learn from an observed pattern."""
@@ -2803,11 +2907,31 @@ class CellBrain:
         self.save_memory()
 
     def install_skill(self, name: str, code: str, skill_type: str = "defense"):
-        """Install a new skill from Admin or self-evolution."""
-        skill_file = self.skills_dir / f"{name}.py"
-        skill_file.write_text(code)
+        """Install a new skill from Admin or self-evolution.
+
+        SECURITY: Only accepts JSON data files, not executable Python code.
+        Skills are stored as .json files, not .py files.
+        """
+        # Sanitize name — only alphanumeric, hyphens, underscores
+        safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', name)[:64]
+        if not safe_name:
+            log.warning(f"Invalid skill name: {name}")
+            return
+        # Store as JSON data, NOT executable code
+        skill_file = self.skills_dir / f"{safe_name}.json"
+        try:
+            # Validate it's proper JSON
+            if isinstance(code, str):
+                json.loads(code)
+            else:
+                code = json.dumps(code, indent=2)
+            skill_file.write_text(code)
+        except (json.JSONDecodeError, TypeError) as e:
+            log.warning(f"Skill {safe_name} is not valid JSON — storing as raw data")
+            skill_file = self.skills_dir / f"{safe_name}.dat"
+            skill_file.write_text(str(code)[:10000])  # Cap size
         self.memory["skills_installed"].append({
-            "name": name,
+            "name": safe_name,
             "type": skill_type,
             "installed_at": __import__("datetime").datetime.utcnow().isoformat(),
         })
@@ -2877,13 +3001,22 @@ class WraithCell:
 
     def run_all(self) -> Dict:
         """Run all agents and return combined findings."""
-        results = {"cell_id": self.cell_id, "timestamp": __import__("datetime").datetime.utcnow().isoformat(), "findings": {}}
+        results = {"cell_id": self.cell_id, "timestamp": __import__("datetime").datetime.utcnow().isoformat(), "findings": {}, "errors": {}}
         for agent in self.agents:
+            name = agent.__class__.__name__
             try:
-                name = agent.__class__.__name__
-                results["findings"][name] = agent.run()
+                start = time.time()
+                agent_results = agent.run()
+                elapsed = time.time() - start
+                results["findings"][name] = agent_results
+                # Warn if agent takes too long (potential resource exhaustion)
+                if elapsed > 120:
+                    log.warning(f"Agent {name} took {elapsed:.1f}s — possible resource issue")
             except Exception as e:
-                results["findings"][agent.__class__.__name__] = {"error": str(e)}
+                # Log full stack trace internally, don't expose to output
+                log.error(f"Agent {name} failed: {e}", exc_info=True)
+                results["errors"][name] = type(e).__name__
+                results["findings"][name] = []
         return results
 
     def get_status(self) -> Dict:
@@ -2946,19 +3079,40 @@ if __name__ == "__main__":
         print(json.dumps(results, indent=2))
     elif args.start:
         cell.start()
+        consecutive_errors = 0
+        max_consecutive_errors = 5
         try:
-            while True:
-                results = cell.run_all()
-                threats = 0
-                for f in results["findings"].values():
-                    if isinstance(f, list):
-                        threats += len(f)
-                    elif isinstance(f, dict) and f.get("error") is None:
-                        threats += 1
-                if threats > 0:
-                    print(f"{threats} threats detected!")
-                __import__("time").sleep(30)
+            while cell._running:
+                try:
+                    results = cell.run_all()
+                    threats = 0
+                    errors = results.get("errors", {})
+                    for f in results["findings"].values():
+                        if isinstance(f, list):
+                            threats += len(f)
+                        elif isinstance(f, dict) and f.get("error") is None:
+                            threats += 1
+                    if threats > 0:
+                        print(f"{threats} threats detected!")
+                    if errors:
+                        log.warning(f"Agents with errors: {list(errors.keys())}")
+                        consecutive_errors += 1
+                        if consecutive_errors >= max_consecutive_errors:
+                            log.critical(f"{consecutive_errors} consecutive error cycles — entering backoff")
+                            time.sleep(300)  # 5 minute backoff
+                            consecutive_errors = 0
+                    else:
+                        consecutive_errors = 0
+                except Exception as e:
+                    log.error(f"Daemon loop error: {e}", exc_info=True)
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        log.critical("Too many consecutive daemon errors — stopping")
+                        break
+                time.sleep(30)
         except KeyboardInterrupt:
+            pass
+        finally:
             cell.stop()
     elif args.agents:
         for agent_name in args.agents:
